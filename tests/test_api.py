@@ -381,6 +381,173 @@ def test_upload_limit_rejected(tmp_path):
         assert r.json()["detail"]["error"] == "upload_too_large"
 
 
+# ---------------------------------------------------------------------
+# high-compression-ratio (zip-bomb) inputs: bounded inflate
+# ---------------------------------------------------------------------
+
+def crc32_zeros(size: int, block: int = 4 * 1024 * 1024) -> int:
+    """CRC-32 of ``size`` zero bytes without materializing them."""
+    crc = 0
+    zeros = b"\x00" * min(block, size)
+    remaining = size
+    while remaining:
+        b = zeros if remaining >= len(zeros) else b"\x00" * remaining
+        remaining -= len(b)
+        crc = binascii.crc32(b, crc)
+    return crc & 0xFFFFFFFF
+
+
+def high_ratio_zip(size: int, *, descriptor: bool = True,
+                   block: int = 4 * 1024 * 1024) -> tuple[bytes, int, str]:
+    """Build a tiny DEFLATE archive whose member is ``size`` zero bytes.
+
+    The plaintext is never materialized: it is produced, hashed and
+    compressed in fixed blocks.
+
+    Returns ``(archive_bytes, compressed_size, sha256_hex)``.
+    """
+    co = zlib.compressobj(9, zlib.DEFLATED, -15)
+    sha = hashlib.sha256()
+    parts = []
+    remaining = size
+    zeros = b"\x00" * min(block, size)
+    while remaining:
+        b = zeros if remaining >= len(zeros) else b"\x00" * remaining
+        remaining -= len(b)
+        sha.update(b)
+        parts.append(co.compress(b))
+    comp = b"".join(parts + [co.flush()])
+    crc = crc32_zeros(size, block)
+    if descriptor:
+        arc = (lfh(b"bomb.bin", 8, 0x08, 0, 0, 0)
+               + comp + dd_sig(crc, len(comp), size))
+    else:
+        arc = lfh(b"bomb.bin", 8, 0, crc, len(comp), size) + comp
+    return arc, len(comp), sha.hexdigest()
+
+
+def test_high_ratio_member_is_recovered_and_streamed(tmp_path):
+    # 300 MiB of zeros compress to ~300 KiB: one un-bounded inflate call
+    # would need far more than the 512 MiB container budget.
+    arc, csize, want_sha = high_ratio_zip(300 * 1024 * 1024)
+    assert len(arc) < 1024 * 1024
+    app = create_app(Settings(data_dir=str(tmp_path / "data")))
+    with TestClient(app) as c:
+        r = post(c, arc)
+        assert r.status_code == 201, r.text
+        rep = r.json()
+        e = rep["entries"][0]
+        assert e["status"] == "confirmed"
+        assert e["descriptor"] == "signature"
+        assert e["size"] == 300 * 1024 * 1024
+        assert e["compressed_size"] == csize
+        assert e["sha256"] == want_sha
+        assert rep["summary"]["expanded_bytes"] == e["size"]
+        job = rep["id"]
+        # download streams from disk; hash the response without buffering it
+        with c.stream("GET", f"/recover/{job}/entries/0") as d:
+            assert d.status_code == 200
+            assert int(d.headers["content-length"]) == e["size"]
+            got = hashlib.sha256()
+            n = 0
+            for piece in d.iter_bytes(4 * 1024 * 1024):
+                got.update(piece)
+                n += len(piece)
+        assert n == e["size"]
+        assert got.hexdigest() == want_sha
+        # the report is persisted like any other job
+        assert c.get(f"/recover/{job}").json()["id"] == job
+
+
+def test_high_ratio_without_descriptor_uses_stream_boundary(tmp_path):
+    # sizes known in the local header (bit 3 clear); the descriptor offset
+    # still has to come from the stream end, which bounded inflate reports
+    arc, _csize, want_sha = high_ratio_zip(64 * 1024 * 1024, descriptor=False)
+    app = create_app(Settings(data_dir=str(tmp_path / "data")))
+    with TestClient(app) as c:
+        r = post(c, arc)
+        assert r.status_code == 201, r.text
+        rep = r.json()
+        e = rep["entries"][0]
+        assert e["status"] == "confirmed"
+        assert e["descriptor"] == "none"
+        assert e["sha256"] == want_sha
+        with c.stream("GET", f"/recover/{rep['id']}/entries/0") as d:
+            n = 0
+            for piece in d.iter_bytes(4 * 1024 * 1024):
+                assert piece == b"\x00" * len(piece)
+                n += len(piece)
+        assert n == e["size"]
+
+
+def test_high_ratio_expand_limit_rejected_and_cleaned(tmp_path):
+    # ~1.3 GiB of zeros from under 2 MiB of archive: over the 1 GiB limit,
+    # but only the bounded loop makes this safe to even attempt
+    arc, _csize, _sha = high_ratio_zip(1300 * 1024 * 1024)
+    assert len(arc) < 2 * 1024 * 1024
+    app = create_app(Settings(data_dir=str(tmp_path / "data")))
+    with TestClient(app) as c:
+        r = post(c, arc)
+        assert r.status_code == 422
+        assert r.json()["detail"]["error"] == "expand_limit_exceeded"
+        assert c.get("/recover").json()["jobs"] == []
+        assert list((tmp_path / "data" / "jobs").iterdir()) == []
+        # no scratch payloads survive either
+        leftovers = list((tmp_path / "data" / "tmp").rglob("*"))
+        assert leftovers == []
+
+
+def high_ratio_entry(name: bytes, size: int, *, signed: bool) -> bytes:
+    """One bit-3 high-ratio DEFLATE entry (signed or unsigned descriptor)."""
+    co = zlib.compressobj(9, zlib.DEFLATED, -15)
+    parts = []
+    remaining = size
+    zeros = b"\x00" * min(4 * 1024 * 1024, size)
+    while remaining:
+        b = zeros if remaining >= len(zeros) else b"\x00" * remaining
+        remaining -= len(b)
+        parts.append(co.compress(b))
+    comp = b"".join(parts + [co.flush()])
+    crc = crc32_zeros(size)
+    desc = dd_sig(crc, len(comp), size) if signed \
+        else dd_nosig(crc, len(comp), size)
+    return lfh(name, 8, 0x08, 0, 0, 0) + comp + desc
+
+
+def test_chained_high_ratio_entries_keep_descriptors_aligned(tmp_path):
+    # two adjacent high-ratio members, one signed and one unsigned
+    # descriptor: consumed-byte accounting must place both descriptors
+    # exactly, so both verify and stay on the confirmed chain
+    arc = (high_ratio_entry(b"first.bin", 120 * 1024 * 1024, signed=True)
+           + high_ratio_entry(b"second.bin", 64 * 1024 * 1024, signed=False))
+    app = create_app(Settings(data_dir=str(tmp_path / "data")))
+    with TestClient(app) as c:
+        r = post(c, arc)
+        assert r.status_code == 201, r.text
+        rep = r.json()
+        assert [e["name"] for e in rep["entries"]] == ["first.bin",
+                                                        "second.bin"]
+        assert [e["status"] for e in rep["entries"]] == ["confirmed",
+                                                          "confirmed"]
+        assert rep["entries"][0]["descriptor"] == "signature"
+        assert rep["entries"][1]["descriptor"] == "nosignature"
+        assert rep["entries"][0]["size"] == 120 * 1024 * 1024
+        assert rep["entries"][1]["size"] == 64 * 1024 * 1024
+        assert rep["summary"]["expanded_bytes"] == 184 * 1024 * 1024
+        assert rep["damaged_ranges"] == []
+        # the second member starts right after the first one ends; both
+        # downloads are the exact original bytes
+        assert rep["entries"][1]["offset"] == rep["entries"][0]["end_offset"]
+        job = rep["id"]
+        for n, size in ((0, 120 * 1024 * 1024), (1, 64 * 1024 * 1024)):
+            with c.stream("GET", f"/recover/{job}/entries/{n}") as d:
+                got = 0
+                for piece in d.iter_bytes(4 * 1024 * 1024):
+                    assert piece == b"\x00" * len(piece)
+                    got += len(piece)
+                assert got == size
+
+
 def test_unknown_job_and_entry(client):
     assert client.get("/recover/nope").status_code == 404
     arc = stored_entry(b"a.txt", b"A" * 4)

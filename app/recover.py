@@ -41,6 +41,11 @@ ZIP64_EOCD_SIG = b"PK\x06\x06"
 ZIP64_LOCATOR_SIG = b"PK\x06\x07"
 
 CHUNK = 1024 * 1024  # 1 MiB streaming quantum
+# Maximum expanded bytes produced by a single inflate call.  It MUST be
+# bounded independently of CHUNK: a handful of compressed bytes can expand
+# by a factor of ~1000, so capping only the compressed input still lets one
+# ``decompress`` call allocate hundreds of MiB.
+DEFLATE_OUT_CHUNK = 1024 * 1024
 
 STORED = 0
 DEFLATE = 8
@@ -115,6 +120,16 @@ class _Budget:
                 "cumulative expanded data exceeds the limit of "
                 f"{self.limit} bytes",
             )
+
+    def checkpoint(self) -> int:
+        return self.used
+
+    def rollback(self, mark: int) -> None:
+        # continuation probes verify bytes the main walk will charge again
+        # when the entry is really accepted; undo the probe's charges so
+        # member bytes are counted exactly once (while the limit still
+        # applied during the probe itself)
+        self.used = mark
 
 
 class _PayloadWriter:
@@ -375,25 +390,35 @@ class Recoverer:
                          probe_cont: bool) -> bool:
         mm = self.mm
         assert mm is not None
-        size = self.size
         writer = self._new_writer() if write_payload else None
         d = zlib.decompressobj(-15)
         p = ent.data_offset
-        fed = 0
         out_crc = 0
         out_len = 0
+        # ``pending`` holds compressed bytes already taken from the mmap but
+        # not fully consumed by inflate (output cap), re-fed on the next
+        # round instead of being pulled again.
+        pending = b""
         try:
-            while p < size and not d.eof:
-                chunk = bytes(mm[p : p + CHUNK])
-                out = d.decompress(chunk)
-                fed += len(chunk)
-                p += len(chunk)
+            while not d.eof:
+                if not pending:
+                    pending = bytes(mm[p : p + CHUNK])
+                    p += len(pending)
+                    if not pending:
+                        break  # truncated stream
+                out = d.decompress(pending, DEFLATE_OUT_CHUNK)
                 if out:
                     self.budget.charge(len(out))
                     out_crc = binascii.crc32(out, out_crc)
                     out_len += len(out)
                     if writer is not None:
                         writer.write(out)
+                if d.eof:
+                    # When the output cap binds exactly at stream end,
+                    # unconsumed_tail and unused_data alias the SAME suffix
+                    # bytes; stop immediately and trust unused_data alone.
+                    break
+                pending = d.unconsumed_tail
         except zlib.error as exc:
             self._cleanup_writer(writer)
             self._fail(f"deflate stream error: {exc}")
@@ -402,7 +427,10 @@ class Recoverer:
             self._cleanup_writer(writer)
             self._fail("truncated deflate stream")
             return False
-        consumed = fed - len(d.unused_data)
+        # Bytes actually consumed by the deflate stream = distinct bytes
+        # pulled up to the end marker (``p``) minus the post-stream suffix
+        # (data descriptor / next header), which is still in unused_data.
+        consumed = p - ent.data_offset - len(d.unused_data)
         dd_off = ent.data_offset + consumed
         ent.crc32 = out_crc
         ent.compressed_size = consumed
@@ -410,11 +438,11 @@ class Recoverer:
 
         if has_dd:
             cands: List[_Candidate] = []
-            if dd_off + 16 <= size and mm[dd_off : dd_off + 4] == DD_SIG:
+            if dd_off + 16 <= self.size and mm[dd_off : dd_off + 4] == DD_SIG:
                 c, cs, us = struct.unpack("<3I", mm[dd_off + 4 : dd_off + 16])
                 cands.append(_Candidate(dd_off, dd_off + 16, "signature",
                                         c, cs, us))
-            if dd_off + 12 <= size:
+            if dd_off + 12 <= self.size:
                 c, cs, us = struct.unpack("<3I", mm[dd_off : dd_off + 12])
                 cands.append(_Candidate(dd_off, dd_off + 12, "nosignature",
                                         c, cs, us))
@@ -600,8 +628,18 @@ class Recoverer:
         if sig in (CD_SIG, EOCD_SIG):
             return 1
         if sig == LFH_SIG:
-            probe = self._try_entry(end, strict=False, write_payload=False,
-                                    probe_cont=False)
+            # This is only a lookahead: the probed member's expanded bytes
+            # (if any) are charged by the real walk later, so undo the
+            # probe's charges to avoid counting them twice.  The limit is
+            # still enforced while the probe runs -- a bomb-looking member
+            # is never expanded freely.
+            mark = self.budget.checkpoint()
+            try:
+                probe = self._try_entry(end, strict=False,
+                                        write_payload=False,
+                                        probe_cont=False)
+            finally:
+                self.budget.rollback(mark)
             if probe is not None:
                 return 1
         return 0
