@@ -41,6 +41,7 @@ ZIP64_EOCD_SIG = b"PK\x06\x06"
 ZIP64_LOCATOR_SIG = b"PK\x06\x07"
 
 CHUNK = 1024 * 1024  # 1 MiB streaming quantum
+MAX_OUT = 4 * 1024 * 1024  # bound on one decompress() call's output
 
 STORED = 0
 DEFLATE = 8
@@ -383,11 +384,27 @@ class Recoverer:
         out_crc = 0
         out_len = 0
         try:
-            while p < size and not d.eof:
-                chunk = bytes(mm[p : p + CHUNK])
-                out = d.decompress(chunk)
-                fed += len(chunk)
-                p += len(chunk)
+            # A single call's output is capped at MAX_OUT so that one
+            # highly-compressed block cannot allocate an unbounded
+            # buffer before the budget is even charged.  When the cap
+            # is hit, the not-yet-consumed compressed input sits in
+            # ``d.unconsumed_tail`` and must be fed back explicitly --
+            # without counting it towards ``fed`` again, or the
+            # consumed-byte computation (and with it the data
+            # descriptor offset) would be shifted.  At eof the tail is
+            # always empty and every trailing byte is in
+            # ``d.unused_data``, so ``fed - len(d.unused_data)`` stays
+            # the exact count of consumed compressed bytes.
+            while not d.eof:
+                if d.unconsumed_tail:
+                    chunk = d.unconsumed_tail
+                elif p < size:
+                    chunk = bytes(mm[p : p + CHUNK])
+                    fed += len(chunk)
+                    p += len(chunk)
+                else:
+                    break
+                out = d.decompress(chunk, MAX_OUT)
                 if out:
                     self.budget.charge(len(out))
                     out_crc = binascii.crc32(out, out_crc)

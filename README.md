@@ -22,6 +22,9 @@
 - 同名条目保留序号（`name_seq`：1、2、3…），按全局序号 `n` 下载；
 - 累计展开量上限 **1 GiB**（防 zip bomb），超限/加密/ZIP64 **整单拒绝，
   不留任何半成品**（临时目录整体清除，数据库无记录）；
+- DEFLATE 解压**单次输出上限 4 MiB**：高压缩比成员（如数百 MiB 零字节
+  压缩成几百 KiB）逐块展开、边展开边计费，不会在计费前一次性分配
+  无界缓冲区，512 MiB 容器内不会 OOM；
 - Docker Compose 一键启动，容器内存限制 **512 MiB**。
 
 ## 快速启动
@@ -63,7 +66,7 @@ curl -s -X POST "http://localhost:8000/recover?filename=corrupted.zip" \
 ```
 
 `samples/corrupted.zip`（三个 STORED 条目，中间一个的数据被覆写）的真实响应
-（`id`、哈希、时间戳每次运行不同）：
+（`id` 与 `created_at` 每次运行不同；哈希对同一输入是确定的）：
 
 ```json
 {
@@ -142,6 +145,45 @@ curl -s -X POST "http://localhost:8000/recover?filename=corrupted.zip" \
 解读：条目 `a.txt` 从起始头连续可校验 → `confirmed`；`b.txt` 的数据 CRC
 校验失败，其字节区间 `[55, 141)` 记入 `damaged_ranges`；扫描在偏移 141 处
 重新找到 `c.txt` 并通过完整校验，但因越过了坏段 → `candidate`。
+
+### 高压缩比成员（限额内正常恢复）
+
+小于 256 MiB 的 ZIP 可能含有单块展开数百 MiB 的 DEFLATE 成员。恢复器以
+4 MiB 为单次解压输出上限逐块展开、逐块计费，内存占用与展开量无关。
+例如一个 700 KiB 的 ZIP 内含 700 MiB 零字节成员（压缩比约 1029:1）：
+
+```bash
+curl -s -X POST "http://localhost:8000/recover?filename=big700.zip" \
+     --data-binary @big700.zip
+```
+
+真实响应（节选，`id`/`created_at` 每次不同）：
+
+```json
+{
+  "id": "30500d2df0c44737b50de1329df88b90",
+  "status": "ok",
+  "upload": { "filename": "big700.zip", "size": 713462,
+              "sha256": "92e736bd0756f08cb83abecf181b9453e787fe49be58d93b0b947aa745fa8d0c" },
+  "summary": { "total_entries": 1, "confirmed": 1, "candidate": 0,
+               "recovered_bytes": 734003200, "expanded_bytes": 734003200 },
+  "entries": [
+    { "n": 0, "name": "zeros.bin", "method": "deflate",
+      "compressed_size": 713423, "size": 734003200,
+      "crc32": "a147a2e0",
+      "sha256": "5fa9e81a64a74879e414f5578bdd3cbc4b8c9acdf42e91d61c78f321dc069e2d",
+      "status": "confirmed", "descriptor": "none",
+      "download": "/recover/30500d2df0c44737b50de1329df88b90/entries/0" }
+  ]
+}
+```
+
+`GET /recover/{id}/entries/0` 流式返回全部 700 MiB 原始字节（SHA-256 与
+报告一致）。若累计展开量超过 1 GiB，则整单拒绝：
+
+```json
+{"detail":{"error":"expand_limit_exceeded","message":"cumulative expanded data exceeds the limit of 1073741824 bytes"}}
+```
 
 ### `GET /recover/{id}`
 
@@ -230,7 +272,10 @@ curl -s -X POST http://localhost:8000/recover --data-binary @samples/encrypted.z
    记为损坏段并向后扫描下一个**能通过完整校验**的局部头。
 2. DEFLATE：以原始 deflate 流自终止边界确定压缩长度，再与局部头或
    数据描述符（先验签名 `PK\x07\x08`，再验无签名 12 字节）交叉校验
-   CRC-32 与长度。
+   CRC-32 与长度。解压时单次调用输出上限 4 MiB：达到上限后，未消费的
+   压缩输入（`unconsumed_tail`）被显式重喂且**不重复计入已喂入字节数**；
+   流尾处 `已喂入 − 未消费（unused_data）` 即为实际消费的压缩字节数，
+   数据描述符偏移据此精确定位，长度、CRC 与报告结果与无上限解压一致。
 3. STORED + bit 3 且长度未知：收集全部候选切分（签名描述符任意位置；
    无签名描述符仅在下一结构边界或 EOF 前 12 字节），用一次增量 CRC 扫描
    线性校验全部候选。
@@ -245,16 +290,23 @@ curl -s -X POST http://localhost:8000/recover --data-binary @samples/encrypted.z
 
 - 上传流式写临时文件（1 MiB 块），全程不驻留内存；
 - 分析通过 `mmap` 只读映射（页面可回收），解压/哈希/落盘全部流式；
-- 展开字节流式写入条目文件并计入 1 GiB 预算；
-- 实测：256 MiB 输入、461 MiB 展开，恢复约 1.2 s，峰值 RSS ≈ 295 MiB
-  （其中大部分为可回收的文件映射页）。
+- **DEFLATE 单次解压输出上限 4 MiB**：高压缩比成员（单块可展开数百
+  MiB）逐块展开、边展开边计入 1 GiB 预算，不会在计费前为一次
+  `decompress()` 调用分配无界缓冲区——这正是 zip-bomb 场景下
+  512 MiB 容器不 OOM 的关键（修复前同一输入峰值 RSS 曾达 1.2 GiB）；
+- 展开字节流式写入条目文件，恢复出的条目本体只落盘、不驻留内存；
+- 实测（容器限额 512 MiB 地址空间内）：
+  - 181 MiB 输入、360 MiB 展开：恢复约 1.4 s，峰值 RSS ≈ 208 MiB
+    （其中大部分为可回收的文件映射页）；
+  - 0.7 MiB 输入、700 MiB 展开（压缩比约 1029:1）：恢复约 4 s，
+    峰值 RSS ≈ 31 MiB。
 
 ## 本地开发与测试
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt -r requirements-dev.txt
-pytest tests/                 # 19 个端到端测试
+pytest tests/                 # 24 个端到端测试
 python3 scripts/make_samples.py samples/   # 重新生成示例 ZIP
 ZIPRECOVER_DATA_DIR=./data uvicorn app.main:app --reload --port 8000
 ```
